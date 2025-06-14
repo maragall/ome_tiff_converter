@@ -263,12 +263,62 @@ def main(acquisition_folder: str, output_folder: str = None):
 
 if __name__ == "__main__":
     import sys
-    
-    if len(sys.argv) < 2:
-        print("Usage: python convert_to_ome_tiff.py <acquisition_folder> [output_folder]")
+    try:
+        from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QPalette, QBrush, QColor, QFont
+        import threading
+    except ImportError:
+        print("PyQt6 is required for the GUI. Please install it with 'pip install PyQt6'.")
         sys.exit(1)
-    
-    acquisition_folder = sys.argv[1]
-    output_folder = sys.argv[2] if len(sys.argv) > 2 else None
-    
-    main(acquisition_folder, output_folder)
+
+    class DropBox(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setAcceptDrops(True)
+            self.setWindowTitle("OME-TIFF Converter")
+            self.setFixedSize(400, 200)
+            layout = QVBoxLayout()
+            self.label = QLabel("Drop your acquisition folder here")
+            self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.label.setFont(QFont("Arial", 14))
+            self.label.setStyleSheet("border: 2px dashed #888; padding: 40px; color: #444;")
+            layout.addWidget(self.label)
+            self.setLayout(layout)
+
+        def dragEnterEvent(self, event: QDragEnterEvent):
+            if event.mimeData().hasUrls():
+                urls = event.mimeData().urls()
+                if len(urls) == 1 and urls[0].isLocalFile():
+                    import os
+                    if os.path.isdir(urls[0].toLocalFile()):
+                        event.acceptProposedAction()
+                        self.label.setStyleSheet("border: 2px dashed #0078d7; padding: 40px; color: #0078d7;")
+                        return
+            event.ignore()
+
+        def dragLeaveEvent(self, event):
+            self.label.setStyleSheet("border: 2px dashed #888; padding: 40px; color: #444;")
+
+        def dropEvent(self, event: QDropEvent):
+            self.label.setStyleSheet("border: 2px dashed #888; padding: 40px; color: #444;")
+            urls = event.mimeData().urls()
+            if len(urls) == 1 and urls[0].isLocalFile():
+                folder = urls[0].toLocalFile()
+                import os
+                if os.path.isdir(folder):
+                    self.label.setText("Converting...")
+                    self.setEnabled(False)
+                    def run():
+                        try:
+                            main(folder)
+                            self.label.setText("Done! Output in ome_output folder.")
+                        except Exception as e:
+                            self.label.setText(f"Error: {str(e)}")
+                        self.setEnabled(True)
+                    threading.Thread(target=run).start()
+
+    app = QApplication(sys.argv)
+    win = DropBox()
+    win.show()
+    sys.exit(app.exec())
