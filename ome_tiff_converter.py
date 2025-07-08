@@ -2,6 +2,7 @@
 """
 Convert microscopy acquisition folder to OME-TIFF format.
 One OME-TIFF per FOV containing all Z, channels, and timepoints.
+Aligned with OMETiffWriter format.
 """
 
 import os
@@ -9,7 +10,7 @@ import json
 import colorsys
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 import numpy as np
 import tifffile
 from ome_types import OME
@@ -18,15 +19,15 @@ from ome_types.model.simple_types import Color, PixelType, UnitsLength
 import uuid
 
 
-def load_acquisition_parameters(folder: Path) -> Tuple[float, float]:
-    """Load pixel size and dz from acquisition parameters."""
+def load_acquisition_parameters(folder: Path) -> Tuple[float, float, dict]:
+    """Load pixel size, dz, and full parameters from acquisition parameters."""
     with open(folder / "acquisition parameters.json", "r") as f:
         params = json.load(f)
     
     pixel_size = params["sensor_pixel_size_um"] / params["objective"]["magnification"]
     dz = params["dz(um)"]
     
-    return pixel_size, dz
+    return pixel_size, dz, params
 
 
 def get_unique_fovs(acquisition_path: Path) -> Dict[str, List[Tuple[str, Path]]]:
@@ -109,8 +110,73 @@ def get_pixel_type_from_dtype(dtype: np.dtype) -> PixelType:
     return dtype_map[dtype]
 
 
-def convert_fov(fov_id: str, files: List[Tuple[str, Path]], output_dir: Path, pixel_size: float, dz: float):
-    """Convert one FOV to OME-TIFF with all timepoints."""
+def create_ome_metadata(shape: Tuple[int, ...], dtype: np.dtype, 
+                       axes: str, pixel_size: float, params: dict, 
+                       channels: List[str], fov_id: str) -> dict:
+    """Create OME metadata compatible with OMETiffWriter format."""
+    metadata: Dict[str, Any] = {
+        'axes': axes.upper()
+    }
+    
+    # Get dimension sizes from axes and shape
+    dim_map = dict(zip(axes.upper(), shape))
+    
+    # Add physical dimensions if available
+    if 'Z' in dim_map and dim_map['Z'] > 1:
+        metadata['PhysicalSizeZ'] = params['dz(um)']
+        metadata['PhysicalSizeZUnit'] = 'µm'
+    
+    if 'X' in dim_map:
+        metadata['PhysicalSizeX'] = pixel_size
+        metadata['PhysicalSizeXUnit'] = 'µm'
+    
+    if 'Y' in dim_map:
+        metadata['PhysicalSizeY'] = pixel_size
+        metadata['PhysicalSizeYUnit'] = 'µm'
+    
+    # Add time increment if available and T dimension exists
+    if 'T' in dim_map and dim_map['T'] > 1 and 'dt(s)' in params and params['dt(s)'] > 0:
+        metadata['TimeIncrement'] = params['dt(s)']
+        metadata['TimeIncrementUnit'] = 's'
+    
+    # Add channel information
+    if 'C' in dim_map and channels:
+        metadata['Channel'] = {'Name': [f"Channel_{ch}nm" for ch in channels]}
+    
+    # Add objective information
+    if 'objective' in params:
+        obj = params['objective']
+        metadata['Objective'] = {
+            'Name': obj.get('name', ''),
+            'LensNA': obj.get('NA'),
+            'NominalMagnification': obj.get('magnification')
+        }
+    
+    # Add detector information
+    if 'sensor_pixel_size_um' in params:
+        metadata['Detector'] = {
+            'PixelSize': params['sensor_pixel_size_um'],
+            'PixelSizeUnit': 'µm'
+        }
+    
+    # Add stage positions if available
+    if 'dx(mm)' in params and 'dy(mm)' in params:
+        metadata['StagePosition'] = {
+            'PositionX': params.get('dx(mm)', 0) * 1000,  # Convert to µm
+            'PositionY': params.get('dy(mm)', 0) * 1000,
+            'PositionZ': 0,  # Could be calculated from Z stack center
+            'PositionXUnit': 'µm',
+            'PositionYUnit': 'µm',
+            'PositionZUnit': 'µm'
+        }
+    
+    return metadata
+
+
+def convert_fov_memmap(fov_id: str, files: List[Tuple[str, Path]], 
+                      output_dir: Path, pixel_size: float, dz: float, 
+                      params: dict):
+    """Convert one FOV to OME-TIFF using memory mapping (aligned with OMETiffWriter)."""
     print(f"\nProcessing FOV {fov_id}...")
     
     # Organize files
@@ -132,101 +198,76 @@ def convert_fov(fov_id: str, files: List[Tuple[str, Path]], output_dir: Path, pi
     n_t = len(timepoints)
     n_z = max(len(tp_data) for tp_data in organized.values())
     n_c = len(channels)
+    n_y, n_x = img_shape
     
-    print(f"  Dimensions: X={img_shape[1]}, Y={img_shape[0]}, Z={n_z}, C={n_c}, T={n_t}")
+    # Build dynamic axes string based on actual dimensions (like OMETiffWriter)
+    axes_parts = []
+    shape_parts = []
     
-    # Create 5D array (TZCYX)
-    data_array = np.zeros((n_t, n_z, n_c, img_shape[0], img_shape[1]), dtype=img_dtype)
+    if n_t > 1:
+        axes_parts.append('T')
+        shape_parts.append(n_t)
+    if n_z > 1:
+        axes_parts.append('Z')
+        shape_parts.append(n_z)
+    if n_c > 1:
+        axes_parts.append('C')
+        shape_parts.append(n_c)
     
-    # Load all images
+    # Always end with YX
+    axes_parts.extend(['Y', 'X'])
+    shape_parts.extend([n_y, n_x])
+    
+    axes = ''.join(axes_parts)
+    shape = tuple(shape_parts)
+    
+    print(f"  Dynamic axes: {axes}")
+    print(f"  Shape: {shape}")
+    
+    # Create metadata
+    metadata = create_ome_metadata(shape, img_dtype, axes, 
+                                  pixel_size, params, channels, fov_id)
+    
+    # Output filename
+    output_file = output_dir / f"{fov_id}.ome.tiff"
+    
+    # Write empty file to disk (like OMETiffWriter does)
+    tifffile.imwrite(
+        output_file,
+        shape=shape,
+        dtype=img_dtype,
+        metadata=metadata,
+        ome=True
+    )
+    
+    # Create memory-mapped array
+    mmap = tifffile.memmap(output_file, dtype=img_dtype)
+    mmap.shape = shape  # Ensure shape is preserved
+    
+    # Build index mapping based on actual axes
+    def get_index(t, z, c):
+        idx = []
+        if 'T' in axes:
+            idx.append(t)
+        if 'Z' in axes:
+            idx.append(z)
+        if 'C' in axes:
+            idx.append(c)
+        return tuple(idx)
+    
+    # Load images directly into memory-mapped array
     for t_idx, tp in enumerate(timepoints):
         for z_idx in range(n_z):
             for c_idx, ch in enumerate(channels):
                 if z_idx in organized[tp] and ch in organized[tp][z_idx]:
                     img = tifffile.imread(organized[tp][z_idx][ch])
-                    data_array[t_idx, z_idx, c_idx] = img
+                    idx = get_index(t_idx, z_idx, c_idx)
+                    mmap[idx] = img
+                    mmap.flush()  # Flush after each write like OMETiffWriter
     
-    # Create OME metadata
-    ome = OME(uuid="urn:uuid:" + str(uuid.uuid4()))
-    
-    pixels = Pixels(
-        id="Pixels:0",
-        dimension_order="XYZCT",
-        size_x=img_shape[1],
-        size_y=img_shape[0],
-        size_z=n_z,
-        size_c=n_c,
-        size_t=n_t,
-        type=get_pixel_type_from_dtype(img_dtype),
-        physical_size_x=pixel_size,
-        physical_size_x_unit=UnitsLength.MICROMETER,
-        physical_size_y=pixel_size,
-        physical_size_y_unit=UnitsLength.MICROMETER,
-        physical_size_z=dz,
-        physical_size_z_unit=UnitsLength.MICROMETER
-    )
-    
-    # Add channels
-    for c_idx, ch in enumerate(channels):
-        channel = Channel(
-            id=f"Channel:{c_idx}",
-            name=f"Channel_{ch}nm",
-            color=Color(generate_channel_color(c_idx, n_c)),
-            samples_per_pixel=1
-        )
-        pixels.channels.append(channel)
-    
-    # Add planes
-    for t in range(n_t):
-        for z in range(n_z):
-            for c in range(n_c):
-                plane = Plane(
-                    the_z=z,
-                    the_c=c,
-                    the_t=t
-                )
-                pixels.planes.append(plane)
-    
-    # Add TiffData
-    for i in range(n_t * n_z * n_c):
-        t = i // (n_z * n_c)
-        z = (i % (n_z * n_c)) // n_c
-        c = i % n_c
-        
-        tiff_data = TiffData(
-            ifd=i,
-            plane_count=1,
-            first_z=z,
-            first_c=c,
-            first_t=t
-        )
-        pixels.tiff_data_blocks.append(tiff_data)
-    
-    # Create image
-    image = Image(
-        id="Image:0",
-        name=fov_id,
-        pixels=pixels
-    )
-    
-    ome.images.append(image)
-    
-    # Write OME-TIFF
-    output_file = output_dir / f"{fov_id}.ome.tiff"
-    ome_xml = ome.to_xml()
-    
-    # Write as OME-TIFF (not ImageJ format)
-    tifffile.imwrite(
-        output_file,
-        data_array,
-        description=ome_xml,
-        metadata={'axes': 'TZCYX'},
-        resolution=(1./pixel_size, 1./pixel_size),
-        tile=(256, 256),
-        compression='lzw',
-        photometric='minisblack',
-        ome=True  # Force OME-TIFF format
-    )
+    # Final flush
+    mmap.flush()
+    del mmap  # Close the memory map
     
     print(f"  Saved {output_file.name}")
 
@@ -244,18 +285,20 @@ def main(acquisition_folder: str, output_folder: str = None):
     
     # Load parameters
     print("Loading acquisition parameters...")
-    pixel_size, dz = load_acquisition_parameters(acquisition_path)
+    pixel_size, dz, params = load_acquisition_parameters(acquisition_path)
     
     print(f"Pixel size: {pixel_size:.3f} µm")
     print(f"Z step: {dz} µm")
+    print(f"Time interval: {params.get('dt(s)', 0)} s")
+    print(f"Objective: {params['objective']['name']} ({params['objective']['magnification']}x)")
     
     # Find all FOVs across timepoints
     fov_map = get_unique_fovs(acquisition_path)
     print(f"\nFound {len(fov_map)} FOVs across all timepoints")
     
-    # Convert each FOV
+    # Convert each FOV using memory mapping
     for fov_id, files in sorted(fov_map.items()):
-        convert_fov(fov_id, files, output_path, pixel_size, dz)
+        convert_fov_memmap(fov_id, files, output_path, pixel_size, dz, params)
     
     print(f"\nConversion complete! Output saved to: {output_path}")
     print("Each OME-TIFF contains all timepoints, Z-slices, and channels for one FOV")
