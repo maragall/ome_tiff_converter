@@ -116,10 +116,11 @@ class AcquisitionConverter:
 
     def get_unique_fovs(self) -> Dict[str, List[Tuple[str, Path]]]:
         fov_map = {}
-        timepoint_dirs = sorted([
-            d for d in self.acquisition_folder.iterdir()
-            if d.is_dir() and d.name.isdigit()
-        ])
+        timepoint_dirs = sorted(
+            [d for d in self.acquisition_folder.iterdir()
+             if d.is_dir() and d.name.isdigit()],
+            key=lambda d: int(d.name),
+        )
         for tp_dir in timepoint_dirs:
             for tiff_file in tp_dir.glob("*.tiff"):
                 parts = tiff_file.stem.split("_")
@@ -132,10 +133,11 @@ class AcquisitionConverter:
 
     def get_all_channels(self) -> List[str]:
         channels = set()
-        timepoint_dirs = sorted([
-            d for d in self.acquisition_folder.iterdir()
-            if d.is_dir() and d.name.isdigit()
-        ])
+        timepoint_dirs = sorted(
+            [d for d in self.acquisition_folder.iterdir()
+             if d.is_dir() and d.name.isdigit()],
+            key=lambda d: int(d.name),
+        )
         if timepoint_dirs:
             for tiff_file in timepoint_dirs[0].glob("*.tiff"):
                 parts = tiff_file.stem.split("_")
@@ -164,7 +166,7 @@ class AcquisitionConverter:
         return sorted(channels)
 
     def get_dimension_sizes(self, organized_files: Dict, channels: List[str]) -> Dict[str, int]:
-        timepoints = sorted(organized_files.keys())
+        timepoints = sorted(organized_files.keys(), key=int)
         n_t = len(timepoints)
         n_z = max(len(tp_data) for tp_data in organized_files.values()) if organized_files else 1
         n_c = len(channels)
@@ -202,7 +204,7 @@ class AcquisitionConverter:
 
         position_sizes = writer.position_sizes[0]
 
-        timepoints = sorted(organized_files.keys())
+        timepoints = sorted(organized_files.keys(), key=int)
         first_tp = timepoints[0]
         first_z = sorted(organized_files[first_tp].keys())[0]
         first_file = organized_files[first_tp][first_z][channels[0]]
