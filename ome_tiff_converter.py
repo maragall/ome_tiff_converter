@@ -125,12 +125,21 @@ class AcquisitionConverter:
         for tp_dir in timepoint_dirs:
             for tiff_file in tp_dir.glob("*.tiff"):
                 parts = tiff_file.stem.split("_")
-                if len(parts) >= 6:
+                if len(parts) >= 4:
                     fov_id = f"{parts[0]}_{parts[1]}"
                     if fov_id not in fov_map:
                         fov_map[fov_id] = []
                     fov_map[fov_id].append((tp_dir.name, tiff_file))
         return fov_map
+
+    @staticmethod
+    def _channel_name(stem: str) -> Optional[str]:
+        """Squid filename: {region}_{fov}_{z}_{channel_name_safe}.tiff.
+        Returns the full channel_name_safe or None if the filename is too short."""
+        parts = stem.split("_")
+        if len(parts) < 4:
+            return None
+        return "_".join(parts[3:])
 
     def get_all_channels(self) -> List[str]:
         channels = set()
@@ -141,17 +150,19 @@ class AcquisitionConverter:
         )
         if timepoint_dirs:
             for tiff_file in timepoint_dirs[0].glob("*.tiff"):
-                parts = tiff_file.stem.split("_")
-                if len(parts) >= 6:
-                    channels.add(parts[4])
+                ch = self._channel_name(tiff_file.stem)
+                if ch is not None:
+                    channels.add(ch)
         return sorted(channels)
 
     def organize_fov_files(self, files: List[Tuple[str, Path]]) -> Dict[str, Dict[int, Dict[str, Path]]]:
         organized = {}
         for timepoint, filepath in files:
             parts = filepath.stem.split("_")
+            if len(parts) < 4:
+                continue
             z_level = int(parts[2])
-            wavelength = parts[4]
+            wavelength = "_".join(parts[3:])
             if timepoint not in organized:
                 organized[timepoint] = {}
             if z_level not in organized[timepoint]:
@@ -190,10 +201,13 @@ class AcquisitionConverter:
 
         if channel_filter is not None:
             channel_set = set(channel_filter)
-            files = [(tp, f) for tp, f in files if f.stem.split("_")[4] in channel_set]
+            files = [(tp, f) for tp, f in files if self._channel_name(f.stem) in channel_set]
 
         organized_files = self.organize_fov_files(files)
         channels = self.get_channels(organized_files)
+        if not organized_files or not channels:
+            print(f"  Skipping FOV {fov_id}: no files match the current channel/FOV selection.")
+            return
         sizes = self.get_dimension_sizes(organized_files, channels)
 
         sequence = MDASequence(sizes, self.pixel_size, self.params, channels)
@@ -278,7 +292,7 @@ if __name__ == "__main__":
     try:
         from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
                                       QRadioButton, QButtonGroup, QDialog, QCheckBox,
-                                      QPushButton, QListWidget, QListWidgetItem)
+                                      QPushButton, QListWidget, QListWidgetItem, QFileDialog)
         from PyQt6.QtCore import Qt
         from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont
     except ImportError:
@@ -349,7 +363,9 @@ if __name__ == "__main__":
             super().__init__()
             self.setAcceptDrops(True)
             self.setWindowTitle("OME-TIFF Converter")
-            self.setFixedSize(450, 250)
+            self.setFixedSize(500, 320)
+
+            self.output_folder: Optional[str] = None
 
             layout = QVBoxLayout()
 
@@ -364,6 +380,18 @@ if __name__ == "__main__":
             mode_layout.addWidget(self.imagej_radio)
             layout.addLayout(mode_layout)
 
+            out_row = QHBoxLayout()
+            self.out_label = QLabel("Output: default (next to acquisition)")
+            self.out_label.setStyleSheet("color: #444;")
+            browse_btn = QPushButton("Choose output…")
+            clear_btn = QPushButton("Reset")
+            browse_btn.clicked.connect(self._pick_output_folder)
+            clear_btn.clicked.connect(self._clear_output_folder)
+            out_row.addWidget(self.out_label, 1)
+            out_row.addWidget(browse_btn)
+            out_row.addWidget(clear_btn)
+            layout.addLayout(out_row)
+
             self.label = QLabel("Drop your acquisition folder here")
             self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.label.setFont(QFont("Arial", 14))
@@ -371,6 +399,16 @@ if __name__ == "__main__":
             layout.addWidget(self.label)
 
             self.setLayout(layout)
+
+        def _pick_output_folder(self):
+            chosen = QFileDialog.getExistingDirectory(self, "Select output folder")
+            if chosen:
+                self.output_folder = chosen
+                self.out_label.setText(f"Output: {chosen}")
+
+        def _clear_output_folder(self):
+            self.output_folder = None
+            self.out_label.setText("Output: default (next to acquisition)")
 
         def dragEnterEvent(self, event: QDragEnterEvent):
             if event.mimeData().hasUrls():
@@ -416,12 +454,13 @@ if __name__ == "__main__":
                         f"{len(selected_channels)} channels...")
                     self.setEnabled(False)
 
+                    out_dir = self.output_folder
                     def run():
                         try:
-                            main(folder, mode=mode,
+                            main(folder, output_folder=out_dir, mode=mode,
                                  channels=selected_channels, fovs=selected_fovs)
-                            self.label.setText(
-                                f"Done! Output in {mode}_output folder.")
+                            location = out_dir if out_dir else f"{mode}_output folder"
+                            self.label.setText(f"Done! Output in {location}.")
                         except Exception as e:
                             self.label.setText(f"Error: {str(e)}")
                         self.setEnabled(True)
