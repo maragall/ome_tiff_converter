@@ -152,7 +152,6 @@ class OMETiffWriter:
             metadata=metadata,
             imagej=not self._is_ome,
             ome=self._is_ome,
-            photometric='minisblack',
         )
 
         mmap = tifffile.memmap(fname, dtype=dtype)
