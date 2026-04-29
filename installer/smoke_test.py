@@ -29,6 +29,24 @@ def run():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     results = []
 
+    def t_self_contained_python():
+        # Prove the .exe is using the BUNDLED Python, not the host machine's
+        # Python install. PyInstaller sets sys.frozen=True and extracts the
+        # bundled interpreter to sys._MEIPASS; sys.prefix should point inside
+        # that directory. If a developer ever drops the spec's runtime_tmpdir
+        # or breaks the freeze, this assertion catches it before users see it.
+        assert getattr(sys, "frozen", False), (
+            "sys.frozen is False -- not running from a PyInstaller bundle"
+        )
+        meipass = getattr(sys, "_MEIPASS", None)
+        assert meipass, "sys._MEIPASS missing -- bootloader did not extract bundle"
+        # sys.prefix must live inside the bundle's extraction dir
+        prefix_inside = sys.prefix == meipass or sys.prefix.startswith(meipass)
+        assert prefix_inside, (
+            f"sys.prefix={sys.prefix!r} is OUTSIDE sys._MEIPASS={meipass!r}; "
+            f"bundle may be using the host machine's Python install"
+        )
+
     def t_pyqt6():
         from PyQt6.QtWidgets import QApplication, QWidget  # noqa: F401
         from PyQt6.QtCore import Qt  # noqa: F401
@@ -113,6 +131,7 @@ def run():
             shutil.rmtree(work, ignore_errors=True)
 
     tests = [
+        ("bundle uses its own Python (not host's)", t_self_contained_python),
         ("PyQt6 imports", t_pyqt6),
         ("PyQt6 QApplication starts (platform plugin found)", t_pyqt6_app_instance),
         ("tifffile read/write round-trip", t_tifffile_roundtrip),
