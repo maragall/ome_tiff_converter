@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
+# large local-only test data
+*.tif
+*.tiff
+!installer/*.tif
+!installer/*.tiff
+
+# build artifacts
+nuo6 9_0 Qingyuan.tif

@@ -338,7 +338,9 @@ def main(acquisition_folder: str, output_folder: str = None, mode: str = "ome",
     converter.convert_all(mode, channels=channels, fovs=fovs)
 
 
-if __name__ == "__main__":
+def gui_main():
+    """Launch the drag-and-drop GUI. Imports PyQt6 lazily so the rest of
+    the module can be imported as a library without a Qt install."""
     import sys
     import threading
     try:
@@ -522,3 +524,7 @@ if __name__ == "__main__":
     win = DropBox()
     win.show()
     sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    gui_main()
