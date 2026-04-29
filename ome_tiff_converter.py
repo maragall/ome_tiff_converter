@@ -6,8 +6,9 @@ Based on Talley's OMETiffWriter architecture.
 
 import os
 import json
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional, Set
 import numpy as np
 import tifffile
 
@@ -111,12 +112,74 @@ class AcquisitionConverter:
         self.pixel_size: float = 0.0
         self.dz: float = 0.0
         self.params: Dict[str, Any] = {}
+        self._known_channels_safe: Optional[Set[str]] = None
 
     def load_acquisition_parameters(self) -> None:
         with open(self.acquisition_folder / "acquisition parameters.json", "r") as f:
             self.params = json.load(f)
         self.pixel_size = self.params["sensor_pixel_size_um"] / self.params["objective"]["magnification"]
         self.dz = self.params["dz(um)"]
+
+    def _get_known_channels_safe(self) -> Set[str]:
+        """Channel name list from configurations.xml, with spaces replaced by
+        underscores to match Squid's channel_name_safe in filenames. Returns
+        an empty set if configurations.xml is missing or unreadable; in that
+        case _parse_stem falls back to a positional split that assumes
+        region_id has no internal underscores.
+        """
+        if self._known_channels_safe is not None:
+            return self._known_channels_safe
+        cfg = self.acquisition_folder / "configurations.xml"
+        if not cfg.exists():
+            self._known_channels_safe = set()
+            return self._known_channels_safe
+        try:
+            root = ET.parse(cfg).getroot()
+            self._known_channels_safe = {
+                el.get("Name").replace(" ", "_")
+                for el in root.iter("mode")
+                if el.get("Name")
+            }
+        except ET.ParseError:
+            self._known_channels_safe = set()
+        return self._known_channels_safe
+
+    def _parse_stem(self, stem: str) -> Optional[Tuple[str, str, int, str]]:
+        """Parse a Squid TIFF stem `{region_id}_{fov}_{z}_{channel_name_safe}`
+        into (region_id, fov, z_level, channel_name_safe).
+
+        With configurations.xml available, strip the longest matching channel
+        suffix from the end and split the remaining file_id; this handles
+        region_ids and channel names that contain underscores.
+
+        Without configurations.xml, fall back to positional split (assumes
+        region_id is exactly the first underscore-separated token).
+        """
+        for ch in sorted(self._get_known_channels_safe(), key=len, reverse=True):
+            suffix = "_" + ch
+            if stem.endswith(suffix):
+                file_id = stem[: -len(suffix)]
+                id_parts = file_id.split("_")
+                if len(id_parts) < 3:
+                    continue
+                try:
+                    z = int(id_parts[-1])
+                except ValueError:
+                    continue
+                region = "_".join(id_parts[:-2])
+                return (region, id_parts[-2], z, ch)
+        parts = stem.split("_")
+        if len(parts) < 4:
+            return None
+        try:
+            z = int(parts[2])
+        except ValueError:
+            return None
+        return (parts[0], parts[1], z, "_".join(parts[3:]))
+
+    def _channel_name(self, stem: str) -> Optional[str]:
+        parsed = self._parse_stem(stem)
+        return parsed[3] if parsed is not None else None
 
     def get_unique_fovs(self) -> Dict[str, List[Tuple[str, Path]]]:
         fov_map = {}
@@ -127,22 +190,13 @@ class AcquisitionConverter:
         )
         for tp_dir in timepoint_dirs:
             for tiff_file in tp_dir.glob("*.tiff"):
-                parts = tiff_file.stem.split("_")
-                if len(parts) >= 4:
-                    fov_id = f"{parts[0]}_{parts[1]}"
-                    if fov_id not in fov_map:
-                        fov_map[fov_id] = []
-                    fov_map[fov_id].append((tp_dir.name, tiff_file))
+                parsed = self._parse_stem(tiff_file.stem)
+                if parsed is None:
+                    continue
+                region, fov, _z, _ch = parsed
+                fov_id = f"{region}_{fov}"
+                fov_map.setdefault(fov_id, []).append((tp_dir.name, tiff_file))
         return fov_map
-
-    @staticmethod
-    def _channel_name(stem: str) -> Optional[str]:
-        """Squid filename: {region}_{fov}_{z}_{channel_name_safe}.tiff.
-        Returns the full channel_name_safe or None if the filename is too short."""
-        parts = stem.split("_")
-        if len(parts) < 4:
-            return None
-        return "_".join(parts[3:])
 
     def get_all_channels(self) -> List[str]:
         channels = set()
@@ -161,16 +215,11 @@ class AcquisitionConverter:
     def organize_fov_files(self, files: List[Tuple[str, Path]]) -> Dict[str, Dict[int, Dict[str, Path]]]:
         organized = {}
         for timepoint, filepath in files:
-            parts = filepath.stem.split("_")
-            if len(parts) < 4:
+            parsed = self._parse_stem(filepath.stem)
+            if parsed is None:
                 continue
-            z_level = int(parts[2])
-            wavelength = "_".join(parts[3:])
-            if timepoint not in organized:
-                organized[timepoint] = {}
-            if z_level not in organized[timepoint]:
-                organized[timepoint][z_level] = {}
-            organized[timepoint][z_level][wavelength] = filepath
+            _region, _fov, z_level, channel = parsed
+            organized.setdefault(timepoint, {}).setdefault(z_level, {})[channel] = filepath
         return organized
 
     def get_channels(self, organized_files: Dict) -> List[str]:
