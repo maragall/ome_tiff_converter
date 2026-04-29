@@ -59,27 +59,26 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# One-file mode: ship a single self-contained ome_tiff_converter.exe.
+# At runtime PyInstaller's bootloader extracts the bundled Python +
+# dependencies to a per-process temp dir (sys._MEIPASS) and execs the
+# real entry. Trade-offs vs one-folder: ~2-3 s slower cold start,
+# slightly larger single file, but no supporting folder to lose.
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     [],
-    exclude_binaries=True,
     name="ome_tiff_converter",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,  # disabled: UPX-packed exes get false-flagged by some AV vendors
-    console=False,
-    icon=None,
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=False,
     upx_exclude=[],
-    name="ome_tiff_converter",
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    icon=None,
 )

@@ -44,7 +44,7 @@ jobs:
       - name: Smoke-test the built .exe
         shell: pwsh
         run: |
-          dist\ome_tiff_converter\ome_tiff_converter.exe --smoke-test
+          dist\ome_tiff_converter.exe --smoke-test
         # If the smoke tests fail (missing dep, can't load Qt plugin, parse
         # broken in the bundle, conversion broken), the workflow fails here.
 
@@ -52,5 +52,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ome-tiff-converter-windows
-          path: dist/ome_tiff_converter/
+          path: dist/ome_tiff_converter.exe
           if-no-files-found: error
