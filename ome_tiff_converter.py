@@ -1,17 +1,96 @@
 #!/usr/bin/env python3
 """
 Convert microscopy acquisition folder to OME-TIFF format.
-Based on Talley's OMETiffWriter architecture.
+
+OME-TIFF output mirrors Squid's native OME format (see
+github.com/Cephla-Lab/Squid software/control/core/utils_ome_tiff_writer.py):
+allocate the file with tifffile, memmap-write each plane, then overwrite
+the OME-XML via tiffcomment so the final XML matches Squid's structure
+(Creator="Squid", DimensionOrder="TZCYX", Channel/SamplesPerPixel="1",
+PhysicalSize* attributes).
 """
 
 import os
 import json
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
 import numpy as np
 import tifffile
 
 IMAGEJ_AXIS_ORDER = "tzcyxs"
+
+OME_NS = "http://www.openmicroscopy.org/Schemas/OME/2016-06"
+OME_DTYPE_MAP = {
+    "uint8": "uint8", "uint16": "uint16", "uint32": "uint32",
+    "int8":  "int8",  "int16":  "int16",  "int32":  "int32",
+    "float32": "float", "float64": "double",
+}
+
+
+def build_squid_ome_xml(
+    shape_tzcyx: Tuple[int, int, int, int, int],
+    dtype: np.dtype,
+    channel_names: List[str],
+    physical_size_x_um: Optional[float] = None,
+    physical_size_y_um: Optional[float] = None,
+    physical_size_z_um: Optional[float] = None,
+    time_increment_s: Optional[float] = None,
+) -> str:
+    """Build OME-XML matching Squid's native format (utils_ome_tiff_writer.py)."""
+    ET.register_namespace("", OME_NS)
+    size_t, size_z, size_c, size_y, size_x = shape_tzcyx
+    ome_type = OME_DTYPE_MAP.get(np.dtype(dtype).name, np.dtype(dtype).name)
+
+    root = ET.Element(f"{{{OME_NS}}}OME", attrib={"Creator": "Squid"})
+    image = ET.SubElement(root, f"{{{OME_NS}}}Image", attrib={"ID": "Image:0"})
+    # OME schema requires DimensionOrder to start with XY. "XYCZT" is the
+    # standard order whose innermost-to-outermost layout matches our (T,Z,C,Y,X)
+    # memory layout. Squid's build_base_ome_xml uses "TZCYX" but that is
+    # non-standard and breaks tifffile/Bio-Formats readback; in normal Squid
+    # operation the file inherits tifffile's auto-XYCZT and augment_ome_xml
+    # never touches DimensionOrder, so production Squid OMEs are XYCZT too.
+    pixels_attrs = {
+        "ID": "Pixels:0",
+        "DimensionOrder": "XYCZT",
+        "Type": ome_type,
+        "SizeT": str(size_t),
+        "SizeC": str(size_c),
+        "SizeZ": str(size_z),
+        "SizeY": str(size_y),
+        "SizeX": str(size_x),
+    }
+    if physical_size_x_um is not None:
+        pixels_attrs["PhysicalSizeX"] = str(float(physical_size_x_um))
+        pixels_attrs["PhysicalSizeXUnit"] = "µm"
+    if physical_size_y_um is not None:
+        pixels_attrs["PhysicalSizeY"] = str(float(physical_size_y_um))
+        pixels_attrs["PhysicalSizeYUnit"] = "µm"
+    if physical_size_z_um is not None:
+        pixels_attrs["PhysicalSizeZ"] = str(float(physical_size_z_um))
+        pixels_attrs["PhysicalSizeZUnit"] = "µm"
+    if time_increment_s is not None:
+        pixels_attrs["TimeIncrement"] = str(float(time_increment_s))
+        pixels_attrs["TimeIncrementUnit"] = "s"
+    pixels = ET.SubElement(image, f"{{{OME_NS}}}Pixels", attrib=pixels_attrs)
+
+    names = channel_names or [f"Channel {i}" for i in range(size_c)]
+    for idx, name in enumerate(names):
+        ET.SubElement(pixels, f"{{{OME_NS}}}Channel", attrib={
+            "ID": f"Channel:0:{idx}",
+            "Name": name,
+            "SamplesPerPixel": "1",
+        })
+
+    # TiffData maps the contiguous IFD sequence to logical TZC coordinates;
+    # without it tifffile/Bio-Formats can't reconstruct the 5D shape.
+    ET.SubElement(pixels, f"{{{OME_NS}}}TiffData", attrib={
+        "IFD": "0",
+        "PlaneCount": str(size_t * size_z * size_c),
+    })
+
+    body = ET.tostring(root, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>' + body
 
 
 class MDASequence:
@@ -35,6 +114,10 @@ class OMETiffWriter:
         self._is_ome = ".ome.tif" in self._filename
         self.current_sequence: Optional[MDASequence] = None
         self.position_sizes: List[Dict[str, int]] = []
+        # remembered for OME-XML finalization
+        self._written_path: Optional[str] = None
+        self._written_dtype: Optional[np.dtype] = None
+        self._written_sizes: Optional[Dict[str, int]] = None
 
     def sequenceStarted(self, seq: MDASequence) -> None:
         self.current_sequence = seq
@@ -69,12 +152,42 @@ class OMETiffWriter:
             metadata=metadata,
             imagej=not self._is_ome,
             ome=self._is_ome,
+            photometric='minisblack',
         )
 
         mmap = tifffile.memmap(fname, dtype=dtype)
         # tifffile.memmap loses singleton dims
         mmap.shape = shape
+        self._written_path = fname
+        self._written_dtype = np.dtype(dtype)
+        self._written_sizes = dict(sizes)
         return mmap
+
+    def finalize_ome(self) -> None:
+        """Overwrite the OME-XML in the file with Squid-style XML so the
+        output looks like a Squid-native OME-TIFF (Creator='Squid',
+        DimensionOrder='TZCYX', SamplesPerPixel='1', etc.). No-op for
+        ImageJ mode."""
+        if not self._is_ome:
+            return
+        if not (self.current_sequence and self._written_path and self._written_sizes):
+            return
+        seq = self.current_sequence
+        s = self._written_sizes
+        shape_tzcyx = (
+            s.get('t', 1), s.get('z', 1), s.get('c', 1),
+            s.get('y', 1), s.get('x', 1),
+        )
+        xml = build_squid_ome_xml(
+            shape_tzcyx,
+            self._written_dtype or np.dtype("uint16"),
+            list(seq.channels),
+            physical_size_x_um=seq.pixel_size or None,
+            physical_size_y_um=seq.pixel_size or None,
+            physical_size_z_um=seq.z_step or None,
+            time_increment_s=seq.time_interval or None,
+        )
+        tifffile.tiffcomment(self._written_path, xml.encode("utf-8"))
 
     def _sequence_metadata(self) -> Dict[str, Any]:
         if not self._is_ome:
@@ -89,7 +202,7 @@ class OMETiffWriter:
                 metadata["PhysicalSizeZ"] = seq.z_step
                 metadata["PhysicalSizeZUnit"] = "µm"
             if seq.channels:
-                metadata["Channel"] = {"Name": [f"Channel_{c}nm" for c in seq.channels]}
+                metadata["Channel"] = {"Name": list(seq.channels)}
             metadata["PhysicalSizeX"] = seq.pixel_size
             metadata["PhysicalSizeY"] = seq.pixel_size
             metadata["PhysicalSizeXUnit"] = "µm"
@@ -241,6 +354,7 @@ class AcquisitionConverter:
                         writer.write_frame(mmap, get_index_tuple(t_idx, z_idx, c_idx), img)
 
         del mmap
+        writer.finalize_ome()
         print(f"  Saved {output_file.name}")
 
     def convert_all(self, mode: str = "ome", channels: Optional[List[str]] = None,
