@@ -181,15 +181,59 @@ class AcquisitionConverter:
         parsed = self._parse_stem(stem)
         return parsed[3] if parsed is not None else None
 
-    def get_unique_fovs(self) -> Dict[str, List[Tuple[str, Path]]]:
-        fov_map = {}
-        timepoint_dirs = sorted(
+    def _timepoint_dirs(self) -> List[Path]:
+        return sorted(
             [d for d in self.acquisition_folder.iterdir()
              if d.is_dir() and d.name.isdigit()],
             key=lambda d: int(d.name),
         )
-        for tp_dir in timepoint_dirs:
+
+    def detect_format(self) -> str:
+        """Classify the dropped folder as one of Squid's save formats.
+
+        Returns one of:
+          'native_ome'        - SaveOMETiffJob output (since 2025-09-29);
+                                per-FOV {region}_{fov}.ome.tiff in ome_tiff/
+                                subfolder; per-timepoint dirs only have
+                                coordinates.csv.
+          'multi_page_stack'  - SaveImageJob with FILE_SAVING_OPTION =
+                                MULTI_PAGE_TIFF; per-FOV {region}_{fov}_stack.tiff
+                                inside each timepoint dir, all (z, c) appended
+                                as pages with JSON metadata in ImageDescription.
+          'single_tiff'       - SaveImageJob default (since 2024); one
+                                {region}_{fov}_{z}_{channel_name_safe}.tiff
+                                per capture inside each timepoint dir.
+          'unknown'           - none of the above; probably zarr or empty.
+        """
+        ome_dir = self.acquisition_folder / "ome_tiff"
+        if ome_dir.is_dir() and any(ome_dir.glob("*.ome.tiff")):
+            return "native_ome"
+        tp_dirs = self._timepoint_dirs()
+        for tp in tp_dirs:
+            tiffs = list(tp.glob("*.tiff"))
+            if not tiffs:
+                continue
+            stack_count = sum(1 for t in tiffs if t.stem.endswith("_stack"))
+            if stack_count == len(tiffs):
+                return "multi_page_stack"
+            if stack_count < len(tiffs):
+                return "single_tiff"
+        return "unknown"
+
+    def get_unique_fovs(self) -> Dict[str, List[Tuple[str, Path]]]:
+        fmt = self.detect_format()
+        if fmt == "native_ome":
+            return self._unique_fovs_native_ome()
+        if fmt == "multi_page_stack":
+            return self._unique_fovs_stack()
+        return self._unique_fovs_single_tiff()
+
+    def _unique_fovs_single_tiff(self) -> Dict[str, List[Tuple[str, Path]]]:
+        fov_map: Dict[str, List[Tuple[str, Path]]] = {}
+        for tp_dir in self._timepoint_dirs():
             for tiff_file in tp_dir.glob("*.tiff"):
+                if tiff_file.stem.endswith("_stack"):
+                    continue
                 parsed = self._parse_stem(tiff_file.stem)
                 if parsed is None:
                     continue
@@ -198,18 +242,101 @@ class AcquisitionConverter:
                 fov_map.setdefault(fov_id, []).append((tp_dir.name, tiff_file))
         return fov_map
 
+    @staticmethod
+    def _native_ome_fov_id(p: Path) -> str:
+        stem = p.stem
+        return stem[:-4] if stem.endswith(".ome") else stem
+
+    def _unique_fovs_native_ome(self) -> Dict[str, List[Tuple[str, Path]]]:
+        fov_map: Dict[str, List[Tuple[str, Path]]] = {}
+        ome_dir = self.acquisition_folder / "ome_tiff"
+        if not ome_dir.is_dir():
+            return fov_map
+        for f in sorted(ome_dir.glob("*.ome.tiff")):
+            # Native OME files are already multi-timepoint internally;
+            # we use a single placeholder timepoint slot.
+            fov_map[self._native_ome_fov_id(f)] = [("0", f)]
+        return fov_map
+
+    def _unique_fovs_stack(self) -> Dict[str, List[Tuple[str, Path]]]:
+        fov_map: Dict[str, List[Tuple[str, Path]]] = {}
+        for tp_dir in self._timepoint_dirs():
+            for stack_file in tp_dir.glob("*_stack.tiff"):
+                stem = stack_file.stem
+                if stem.endswith("_stack"):
+                    fov_id = stem[: -len("_stack")]
+                    fov_map.setdefault(fov_id, []).append((tp_dir.name, stack_file))
+        return fov_map
+
     def get_all_channels(self) -> List[str]:
-        channels = set()
-        timepoint_dirs = sorted(
-            [d for d in self.acquisition_folder.iterdir()
-             if d.is_dir() and d.name.isdigit()],
-            key=lambda d: int(d.name),
-        )
-        if timepoint_dirs:
-            for tiff_file in timepoint_dirs[0].glob("*.tiff"):
+        fmt = self.detect_format()
+        if fmt == "native_ome":
+            return self._channels_native_ome()
+        if fmt == "multi_page_stack":
+            return self._channels_stack()
+        return self._channels_single_tiff()
+
+    def _channels_single_tiff(self) -> List[str]:
+        channels: Set[str] = set()
+        tp_dirs = self._timepoint_dirs()
+        if tp_dirs:
+            for tiff_file in tp_dirs[0].glob("*.tiff"):
+                if tiff_file.stem.endswith("_stack"):
+                    continue
                 ch = self._channel_name(tiff_file.stem)
                 if ch is not None:
                     channels.add(ch)
+        return sorted(channels)
+
+    def _channels_native_ome(self) -> List[str]:
+        """Channel names from the OME-XML of the first .ome.tiff. Names
+        are returned in the same '_'-separated form as filename channels
+        so the GUI can present a single uniform list across formats."""
+        ome_dir = self.acquisition_folder / "ome_tiff"
+        if not ome_dir.is_dir():
+            return []
+        files = sorted(ome_dir.glob("*.ome.tiff"))
+        if not files:
+            return []
+        try:
+            with tifffile.TiffFile(files[0]) as tf:
+                xml = tf.ome_metadata or ""
+        except Exception:
+            return []
+        import re
+        names = re.findall(r'<Channel[^/]*?Name="([^"]+)"', xml)
+        return sorted({n.replace(" ", "_") for n in names if n})
+
+    @staticmethod
+    def _stack_page_metadata(page) -> Optional[Dict[str, Any]]:
+        """Pull the per-page metadata SaveImageJob writes into the
+        ImageDescription tag (a JSON dict with z_level, channel,
+        channel_index, region_id, fov, ...). Returns None if missing."""
+        desc = page.description
+        if not desc:
+            return None
+        try:
+            meta = json.loads(desc)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return None
+        if isinstance(meta, dict) and "z_level" in meta and "channel" in meta:
+            return meta
+        return None
+
+    def _channels_stack(self) -> List[str]:
+        channels: Set[str] = set()
+        for tp_dir in self._timepoint_dirs():
+            for stack_file in tp_dir.glob("*_stack.tiff"):
+                try:
+                    with tifffile.TiffFile(stack_file) as tf:
+                        for page in tf.pages:
+                            meta = self._stack_page_metadata(page)
+                            if meta:
+                                channels.add(str(meta["channel"]).replace(" ", "_"))
+                except Exception:
+                    continue
+                if channels:
+                    return sorted(channels)
         return sorted(channels)
 
     def organize_fov_files(self, files: List[Tuple[str, Path]]) -> Dict[str, Dict[int, Dict[str, Path]]]:
@@ -307,29 +434,213 @@ class AcquisitionConverter:
         output_path.mkdir(exist_ok=True)
         is_ome = mode.lower() == "ome"
 
-        print(f"Loading acquisition parameters for {mode.upper()} mode...")
-        self.load_acquisition_parameters()
+        # acquisition parameters.json may be missing on some legacy / stitched
+        # folders. Best-effort load; fall back to defaults so the conversion
+        # path still functions for native-OME passthrough where we don't need
+        # pixel size / dz to copy bytes through.
+        try:
+            self.load_acquisition_parameters()
+        except (FileNotFoundError, KeyError, json.JSONDecodeError) as e:
+            print(f"Warning: could not load acquisition parameters ({e}); using defaults.")
+            self.params = self.params or {}
+            self.pixel_size = self.pixel_size or 0.0
+            self.dz = self.dz or 0.0
 
-        print(f"Pixel size: {self.pixel_size:.3f} µm")
-        print(f"Z step: {self.dz} µm")
-        print(f"Time interval: {self.params.get('dt(s)', 0)} s")
-        print(f"Objective: {self.params['objective']['name']} ({self.params['objective']['magnification']}x)")
+        fmt = self.detect_format()
+        print(f"Detected save format: {fmt}")
+        if self.pixel_size:
+            print(f"Pixel size: {self.pixel_size:.3f} µm")
+        if self.dz:
+            print(f"Z step: {self.dz} µm")
+        if self.params.get("dt(s)") is not None:
+            print(f"Time interval: {self.params['dt(s)']} s")
+        if self.params.get("objective"):
+            obj = self.params["objective"]
+            print(f"Objective: {obj.get('name', '?')} ({obj.get('magnification', '?')}x)")
         print(f"Output format: {'OME-TIFF' if is_ome else 'ImageJ TIFF'}")
 
-        fov_map = self.get_unique_fovs()
-
-        if fovs is not None:
-            fov_set = set(fovs)
-            fov_map = {k: v for k, v in fov_map.items() if k in fov_set}
-
-        print(f"\nFound {len(fov_map)} FOVs to convert")
-
-        for fov_id, files in sorted(fov_map.items()):
-            self.convert_fov(fov_id, files, output_path, is_ome, channel_filter=channels)
+        if fmt == "native_ome":
+            self._convert_all_native_ome(output_path, is_ome, channels, fovs)
+        elif fmt == "multi_page_stack":
+            self._convert_all_stack(output_path, is_ome, channels, fovs)
+        elif fmt == "single_tiff":
+            self._convert_all_single_tiff(output_path, is_ome, channels, fovs)
+        else:
+            raise ValueError(
+                f"Could not detect a Squid save format in {self.acquisition_folder}. "
+                f"Expected one of: per-tile TIFFs in numbered timepoint dirs, "
+                f"_stack.tiff per FOV in timepoint dirs, or .ome.tiff in an "
+                f"ome_tiff/ subfolder."
+            )
 
         print(f"\nConversion complete! Output saved to: {output_path}")
         mode_desc = "OME-TIFF with full scientific metadata" if is_ome else "ImageJ-compatible TIFF"
         print(f"Files created in {mode_desc} format")
+
+    def _convert_all_single_tiff(self, output_path: Path, is_ome: bool,
+                                 channels: Optional[List[str]],
+                                 fovs: Optional[List[str]]) -> None:
+        fov_map = self._unique_fovs_single_tiff()
+        if fovs is not None:
+            fov_map = {k: v for k, v in fov_map.items() if k in set(fovs)}
+        print(f"\nFound {len(fov_map)} FOVs to convert")
+        for fov_id, files in sorted(fov_map.items()):
+            self.convert_fov(fov_id, files, output_path, is_ome, channel_filter=channels)
+
+    def _convert_all_native_ome(self, output_path: Path, is_ome: bool,
+                                channels: Optional[List[str]],
+                                fovs: Optional[List[str]]) -> None:
+        import shutil
+        ome_dir = self.acquisition_folder / "ome_tiff"
+        files = sorted(ome_dir.glob("*.ome.tiff"))
+        if fovs is not None:
+            fov_set = set(fovs)
+            files = [f for f in files if self._native_ome_fov_id(f) in fov_set]
+        print(f"\nFound {len(files)} FOVs to convert")
+        for src in files:
+            fov_id = self._native_ome_fov_id(src)
+            print(f"\nProcessing FOV {fov_id} (native OME -> {'OME' if is_ome else 'ImageJ'} mode)...")
+            ext = ".ome.tif" if is_ome else ".tif"
+            dest = output_path / f"{fov_id}{ext}"
+            if is_ome and channels is None:
+                # Already in the target format and no channel filtering needed.
+                # Byte-copy is fastest and preserves the OME-XML exactly as
+                # Squid wrote it.
+                shutil.copy2(src, dest)
+                print(f"  Copied {dest.name} (passthrough)")
+            else:
+                self._transcode_native_ome(src, dest, is_ome, channels)
+
+    def _transcode_native_ome(self, src: Path, dest: Path, is_ome: bool,
+                              channel_filter: Optional[List[str]]) -> None:
+        """Read a native OME-TIFF, optionally slice the channel axis to a
+        requested subset, write back as OME or ImageJ format."""
+        with tifffile.TiffFile(src) as tf:
+            series = tf.series[0]
+            arr = series.asarray()
+            axes = series.axes  # e.g., 'TZCYX' or 'ZCYX'
+            xml = tf.ome_metadata or ""
+        import re
+        all_names = re.findall(r'<Channel[^/]*?Name="([^"]+)"', xml)
+        all_names_safe = [n.replace(" ", "_") for n in all_names]
+        kept_names_safe = all_names_safe
+        if channel_filter is not None:
+            keep = set(channel_filter)
+            indices = [i for i, n in enumerate(all_names_safe) if n in keep]
+            if not indices:
+                print(f"  Skipping {dest.name}: no channels match the filter "
+                      f"(file has {all_names_safe!r}, filter wants {channel_filter!r}).")
+                return
+            if "C" in axes:
+                arr = np.take(arr, indices, axis=axes.index("C"))
+            kept_names_safe = [all_names_safe[i] for i in indices]
+
+        metadata: Dict[str, Any] = {"axes": axes}
+        if is_ome and kept_names_safe:
+            metadata["Channel"] = {"Name": [n.replace("_", " ") for n in kept_names_safe]}
+        tifffile.imwrite(
+            str(dest),
+            arr,
+            imagej=not is_ome,
+            ome=is_ome,
+            photometric="minisblack",
+            metadata=metadata,
+        )
+        print(f"  Transcoded {dest.name} (axes={axes}, shape={arr.shape}, "
+              f"channels={kept_names_safe})")
+
+    def _convert_all_stack(self, output_path: Path, is_ome: bool,
+                           channels: Optional[List[str]],
+                           fovs: Optional[List[str]]) -> None:
+        fov_map = self._unique_fovs_stack()
+        if fovs is not None:
+            fov_map = {k: v for k, v in fov_map.items() if k in set(fovs)}
+        print(f"\nFound {len(fov_map)} FOVs to convert")
+        for fov_id in sorted(fov_map):
+            self._convert_stack_fov(fov_id, fov_map[fov_id], output_path, is_ome, channels)
+
+    def _convert_stack_fov(self, fov_id: str,
+                           tp_files: List[Tuple[str, Path]],
+                           output_path: Path, is_ome: bool,
+                           channel_filter: Optional[List[str]]) -> None:
+        print(f"\nProcessing FOV {fov_id} (multi-page stack -> {'OME' if is_ome else 'ImageJ'} mode)...")
+        tp_files = sorted(tp_files, key=lambda x: int(x[0]))
+
+        # First pass: discover dimensions from page metadata.
+        z_levels: Set[int] = set()
+        channels_set: Set[str] = set()
+        sample_shape = None
+        sample_dtype = None
+        for _tp, stack_path in tp_files:
+            try:
+                with tifffile.TiffFile(stack_path) as tf:
+                    for page in tf.pages:
+                        meta = self._stack_page_metadata(page)
+                        if meta is None:
+                            continue
+                        if sample_shape is None:
+                            sample_shape = page.shape
+                            sample_dtype = page.dtype
+                        z_levels.add(int(meta["z_level"]))
+                        channels_set.add(str(meta["channel"]).replace(" ", "_"))
+            except Exception as e:
+                print(f"  Warning: could not read {stack_path.name}: {e}")
+                continue
+        if not channels_set or sample_shape is None:
+            print(f"  Skipping FOV {fov_id}: no readable pages with metadata.")
+            return
+        if channel_filter is not None:
+            channels_set &= set(channel_filter)
+            if not channels_set:
+                print(f"  Skipping FOV {fov_id}: no channels match the filter.")
+                return
+
+        channels = sorted(channels_set)
+        n_t, n_z, n_c = len(tp_files), len(z_levels), len(channels)
+        n_y, n_x = sample_shape
+        sizes = {"t": n_t, "z": n_z, "c": n_c, "y": n_y, "x": n_x}
+
+        sequence = MDASequence(sizes, self.pixel_size, self.params, channels)
+        ext = ".ome.tif" if is_ome else ".tif"
+        output_file = output_path / f"{fov_id}{ext}"
+        writer = OMETiffWriter(output_file)
+        writer.sequenceStarted(sequence)
+        position_sizes = writer.position_sizes[0]
+        print(f"  Dimension order: {list(position_sizes.keys())}")
+        print(f"  Shape: {list(position_sizes.values())}")
+
+        mmap = writer.new_array("0", sample_dtype, position_sizes)
+
+        def get_index_tuple(t_idx: int, z_idx: int, c_idx: int) -> tuple:
+            v = {"t": t_idx, "z": z_idx, "c": c_idx}
+            return tuple(v[d.lower()] for d in position_sizes if d.lower() in v)
+
+        z_idx_map = {z: i for i, z in enumerate(sorted(z_levels))}
+        c_idx_map = {ch: i for i, ch in enumerate(channels)}
+
+        # Second pass: write each page to its (t, z, c) slot.
+        for t_idx, (_tp, stack_path) in enumerate(tp_files):
+            try:
+                with tifffile.TiffFile(stack_path) as tf:
+                    for page in tf.pages:
+                        meta = self._stack_page_metadata(page)
+                        if meta is None:
+                            continue
+                        ch = str(meta["channel"]).replace(" ", "_")
+                        z = int(meta["z_level"])
+                        if ch not in c_idx_map or z not in z_idx_map:
+                            continue
+                        writer.write_frame(
+                            mmap,
+                            get_index_tuple(t_idx, z_idx_map[z], c_idx_map[ch]),
+                            page.asarray(),
+                        )
+            except Exception as e:
+                print(f"  Warning: failed to write some pages from {stack_path.name}: {e}")
+                continue
+
+        del mmap
+        print(f"  Saved {output_file.name}")
 
 
 def main(acquisition_folder: str, output_folder: str = None, mode: str = "ome",
